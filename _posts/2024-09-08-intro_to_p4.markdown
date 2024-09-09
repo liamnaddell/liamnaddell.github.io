@@ -1,0 +1,219 @@
+---
+layout: post
+title:  "Introduction to the P4 Programming Language"
+date:   2024-09-08 09:49:53 -0400
+categories: jekyll update
+---
+
+# P4: A language for computers too optimized for CPU or RAM.
+
+The world of computer networking, specifically high-end routing, can be insular, and difficult to understand. The concepts found in computer networking typically struggle to work their way out of the networking bubble, and into the mainstream.
+
+Recently, I finished an internship at Cisco, in Ottawa. It was a great experience, where I had the opportunity to be introduced to this insular world of router design. This is an article about those concepts. 
+
+## What is P4.
+
+I (barely) remember stumbling across P4 before my internship, and after asking some friends interested in language design, I found that the experience of clicking into the P4 website, muttering, "This looks cool, but why would anyone ever use this", then leaving, is quite common. 
+
+In short, P4's flashy website does not do justice to how amazing it's concepts are. If you scratch the surface, you will find that P4 is a beautiful expression of a world where optimization was pushed so far, the concept of CPU and RAM became obsolete.
+
+P4 is a DSL for these strange machines. 
+
+## No CPU, no RAM?
+
+An obvious question arises: What would a computer without CPU or RAM even look like? The answer is found by replacing the CPU with an NPU, and RAM with TCAM.
+
+### NPU
+
+The NPU is the execution context for a P4 program. This NPU (Network Processing Unit) is designed to take ingress packets over the wire, and perform a set of parsing / deparsing operations. In essence, it's a machine with minimal processing capabilities, but very well defined parsing (ingress) and deparsing (egress) functionality. It's sometimes referred to as a macro engine.
+
+### TCAM
+
+Ternary Content Accessible Memory is like RAM, but instead of searching for a value by index, you search by content. In essence, you supply a bitmask (including dont-care bits, hence TERNARY CAM), and the memory controller will iterate through memory to find all (if any) matching values. One can imagine how such hardware might be useful for looking up things like IP prefixes, and MAC addresses quickly.
+
+For example, Lets say I have the following bits in memory:
+
+```
+000000
+010100
+101110
+111111
+```
+
+I could search TCAM for `1????0`, and I would get back `101110`. 
+
+### It gets better...
+
+It's not just a hash map, implemented in hardware, using bitmasks to search up
+keys. If you squint at it, it's actually also a database engine, implemented in
+hardware, using bitmasks as keys. 
+
+Instead of thinking in terms of memory cells and rows, what if instead, you
+thought of 
+
+```
+000000
+010100
+101110
+111111
+```
+
+as a TABLE of (KEY,PAIR) values WHERE you can SEARCH by defining KEYS.
+
+Even better, consider this table of ip addresses and destination mac addresses.
+We might use this table for storing the results of ARP queries. 
+
+```
+;schema
+;uint32_t ip4 |   uint48_t mac    | uint8_t port
+192.168.2.1   | de:ad:be:ef:00:00 |       1
+10.0.0.1      | fe:ee:df:00:00:0d |       2
+...
+```
+
+We could apply the binary mask 0xc0a80201?????????????? to search for the 48
+bit mac address, and interface to use for an incoming packet with destination address 192.168.2.1. 
+
+
+# Actually using P4. 
+
+I likely cannot afford a real router that has TCAM and a P4-enabled NPU. So, the simulator will have to suffice. The only available one seems to be BMV2, which has a rather clunky build system (and a ton of dependencies on weird libraries). After compiling the P4 compiler, and BMV2, I was ready to get to work!
+
+For the most part, I'm following the instructions found [here](https://opennetworking.org/news-and-events/blog/getting-started-with-p4/). However, I diverged the minute they asked us to fire up Scapy. If you don't know, scapy is one of the most difficult and unfriendly python libraries ever written. There's some brilliant, useful code written for that project, but it's buried under the most unintuitive, typeless python API I have ever seen. I have lost hours trying to figure out how that God-forsaken library works, and have vowed to never again touch that project.
+
+So, I used a sample C packet sender, available [here](https://gist.github.com/austinmarton/1922600) instead :).
+
+After a lot of debugging (for both P4 and C) I was able to get my first packet sent!
+
+```
+liam@gentoo ~ $ sudo tcpdump -xx -v -n -i veth0
+dropped privs to pcap
+tcpdump: listening on veth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+19:49:39.127662 IP truncated-ip - 1004 bytes missing! (tos 0x0, ttl 1, id 0, offset 0, flags [none], proto Options (0), length 1024,
+ bad cksum b6ff (->e932)!)
+    170.170.170.170 > 187.187.187.187:  ip-proto-0 1004
+        0x0000:  0708 090a 0b0c 0102 0304 0506 0800 4500
+        0x0010:  0400 0000 0000 0100 b6ff aaaa aaaa bbbb
+        0x0020:  bbbb
+1 packet captured
+1 packet received by filter
+0 packets dropped by kernel
+```
+
+Unfortunately, as you can see, the cksum is wrong. After fixing some endianness issues, and a conspicuous sizeof(*this) vs sizeof(this). I got all the packet generation issues worked out. Still 100% better than working with scapy though. I regret nothing.
+
+At this point, the P4 program I was using was essentially a pure copy of the Open Networking Foundation article's P4 sample. I wanted to actually try writing a P4 application myself, that accomplished some identifiable goal. So, since I was curious about learning more IPv6, I decided to create a switching program that converts IPv4 packets into IPv6 packets. I spent a lot of time reading through [the P4 specification](https://p4.org/p4-spec/docs/P4-16-v1.0.0-spec.html) to get my code to work. Here's a walktrhough!
+
+{% highlight haskell %}
+typedef bit<48> EthernetAddress;
+typedef bit<32> IPv4Address;
+typedef bit<128> IPv6Address;
+
+header ethernet_t {
+  EthernetAddress dst_addr;
+  EthernetAddress src_addr;
+  bit<16>         ether_type;
+}
+
+header ipv4_t {
+  bit<4>      version;
+  bit<4>      ihl;
+  bit<8>      diffserv;
+  bit<16>     total_len;
+  bit<16>     identification;
+  bit<3>      flags;
+  bit<13>     frag_offset;
+  bit<8>      ttl;
+  bit<8>      protocol;
+  bit<16>     hdr_checksum;
+  IPv4Address src_addr;
+  IPv4Address dst_addr;
+}
+
+header ipv6_t {
+  bit<4> version;
+  bit<8> traffic_class;
+  bit<20> flow_label;
+  bit<16> payload_length;
+  bit<8> next_header;
+  bit<8> hop_limit;
+  IPv6Address source_address;
+  IPv6Address dest_address;
+}
+
+header packet_data {
+  varbit<256> data;
+}
+
+struct headers_t {
+  ethernet_t ethernet;
+  ipv4_t      ipv4;
+  ipv6_t      ipv6;
+  packet_data data;
+}
+{% endhighlight %}
+
+This defines our Ipv4, Ipv6, and ethernet headers. These are relatively standard definitions. As a note, varbit<256> means, "up to 256 bits of data".
+
+Next, we define our ingress parsing rules:
+
+
+{% highlight haskell %}
+parser my_parser(packet_in packet,
+    out headers_t hd,
+    inout metadata_t meta,
+    inout standard_metadata_t standard_meta)
+{
+  state start {
+    packet.extract(hd.ethernet);
+    transition select(hd.ethernet.ether_type) {
+      0x0800:  parse_ipv4;
+      default: accept;
+    }
+  }
+
+  state parse_ipv4 {
+    packet.extract(hd.ipv4);
+    verify(hd.ipv4.version == 4w4, error.IPv4IncorrectVersion);
+    verify(hd.ipv4.ihl == 4w5, error.IPv4OptionsNotSupported);
+    hd.ethernet.ether_type = 0x86DD;
+    hd.ipv6.setValid();
+    hd.ipv6.version = 4w6;
+    hd.ipv6.traffic_class = hd.ipv4.diffserv;
+    hd.ipv6.flow_label = 0;
+    hd.ipv6.payload_length = hd.ipv4.total_len - 20;
+    hd.ipv6.next_header = hd.ipv4.protocol;
+    hd.ipv6.hop_limit = hd.ipv4.ttl;
+    hd.ipv6.source_address = (bit<128>) hd.ipv4.src_addr << 96;
+    hd.ipv6.dest_address = (bit<128>) hd.ipv4.dst_addr << 96;
+
+    transition accept;
+  }
+  state parse_data {
+    //Extract packet data
+    packet.extract(hd.data,(bit<32>) hd.ipv6.payload_length);
+    transition accept;
+  }
+}
+{% endhighlight %}
+
+When the packet comes in, we check the ethertype to see if our packet is IPv4. Then, we parse the ipv4 fields, and create our ipv6 egress packet. After this, we parse any available data encapsulated by the IPv4 packet. 
+
+
+On Egress, we call the "deparser", which simply emits the ipv6 and ethernet headers:
+
+
+{% highlight haskell %}
+control my_deparser(packet_out packet,
+    in headers_t hdr)
+{
+  apply {
+    packet.emit(hdr.ethernet);
+    packet.emit(hdr.ipv6);
+  }
+}
+{% endhighlight %}
+
+## Conclusion
+
+P4 is an extraordinary DSL, which stands as a testament to the kinds of optimizations required to improve router performance after 40 years of continuous development. I hope readers appreciate the view in to what is normally an opaque world. 
